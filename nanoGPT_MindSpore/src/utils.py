@@ -14,7 +14,7 @@ SEQ_LEN = 256
 
 
 def read_jinyong(path: str) -> str:
-    """read Jin Yong fictions"""
+    """支持传入单个 .txt 文件或包含多个 .txt 的目录，自动尝试 UTF-8 和 GBK 编码读取内容并拼接成一个字符串。"""
     files: List[str] = []
     if os.path.isdir(path):
         for root, _, filenames in os.walk(path):

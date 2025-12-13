@@ -14,19 +14,97 @@ from mindspore.ops import functional as F
 class LayerNorm(nn.Cell):
     """LayerNorm but with an optional bias."""
 
-    pass
+    def __init__(self, ndim: int, bias: bool):
+        super().__init__()
+        self.weight = ms.Parameter(ms.ones((ndim,)))
+        self.bias = ms.Parameter(ms.zeros((ndim,))) if bias else None
+        self.eps = 1e-5
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        # 计算均值和方差（在最后一个维度上）
+        mean = x.mean(-1, keep_dims=True)
+        var = x.var(-1, keep_dims=True, unbiased=False)
+        # 归一化
+        x = (x - mean) / ops.sqrt(var + self.eps)
+        # 应用缩放和偏移
+        x = x * self.weight
+        if self.bias is not None:
+            x = x + self.bias
+        return x
 
 
 class CausalSelfAttention(nn.Cell):
-    pass
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_size = config.n_embd // config.n_head
+
+        # QKV投影（合并为一个线性层提高效率）
+        self.qkv_proj = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # 输出投影
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Dropout层
+        self.attn_drop = nn.Dropout(config.dropout)
+        self.resid_drop = nn.Dropout(config.dropout)
+
+        # 因果掩码（下三角矩阵）：防止关注未来token
+        self.mask = np.tril(np.ones((config.block_size, config.block_size), dtype=ms.bool_))
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        B, T, C = x.shape  # 批次大小, 序列长度, 嵌入维度
+
+        # QKV投影并拆分 (B, T, 3*C) -> (B, T, 3, H, C/H) -> 3*(B, H, T, C/H)
+        qkv = self.qkv_proj(x).reshape(B, T, 3, self.n_head, self.head_size)
+        q, k, v = ops.unstack(qkv, axis=2)  # 拆分Q、K、V
+
+        # 注意力计算: (B, H, T, T)
+        attn = (q @ ops.transpose(k, (0, 1, 3, 2))) * (1.0 / ops.sqrt(ms.Tensor(self.head_size, dtype=ms.float32)))
+        # 应用因果掩码（掩盖未来位置）
+        attn = attn.masked_fill(self.mask[:T, :T] == 0, -1e18)
+        attn = ops.softmax(attn, axis=-1)
+        attn = self.attn_drop(attn)
+
+        # 注意力输出: (B, H, T, C/H) -> (B, T, H*C/H) = (B, T, C)
+        y = attn @ v
+        y = ops.transpose(y, (0, 2, 1, 3)).reshape(B, T, C)
+
+        # 输出投影和残差dropout
+        y = self.resid_drop(self.out_proj(y))
+        return y
 
 
 class MLP(nn.Cell):
-    pass
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        x = self.fc1(x)
+        x = self.gelu(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
 
 
 class Block(nn.Cell):
-    pass
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln1 = LayerNorm(config.n_embd, bias=config.bias)  # 注意力前的层归一化
+        self.attn = CausalSelfAttention(config)
+        self.ln2 = LayerNorm(config.n_embd, bias=config.bias)  # MLP前的层归一化
+        self.mlp = MLP(config)
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        # 注意力残差连接
+        x = x + self.attn(self.ln1(x))
+        # MLP残差连接
+        x = x + self.mlp(self.ln2(x))
+        return x
 
 
 @dataclass
@@ -41,10 +119,25 @@ class GPTConfig:
 
 
 class GPT(nn.Cell):
-
     def __init__(self, config: GPTConfig):
         super().__init__()
-        pass
+        assert config.vocab_size is not None, "vocab_size must be specified"
+        assert config.block_size is not None, "block_size must be specified"
+        self.config = config
+        
+         # 核心组件
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)  # Token嵌入
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)  # 位置嵌入
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.SequentialCell([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)  # 最终层归一化
+
+        # 输出头（与Token嵌入共享权重，符合GPT-2设计）
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.wte.embedding_table = self.lm_head.weight  # 权重共享
+
+        # 初始化参数
+        self.apply(self._init_weights)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -77,7 +170,35 @@ class GPT(nn.Cell):
                 )
 
     def construct(self, idx: ms.Tensor, targets: Optional[ms.Tensor] = None):
-        pass
+        B, T = idx.shape
+        assert T <= self.config.block_size, f"序列长度{T}超过最大长度{self.config.block_size}"
+
+        # 位置索引 (0, 1, ..., T-1)
+        pos = ops.arange(0, T, dtype=ms.int64).reshape(1, T)
+
+        # 嵌入计算：Token嵌入 + 位置嵌入
+        tok_emb = self.wte(idx)  # (B, T, n_embd)
+        pos_emb = self.wpe(pos)  # (1, T, n_embd)
+        x = self.drop(tok_emb + pos_emb)  # (B, T, n_embd)
+
+        # 经过所有Transformer块
+        for block in self.blocks:
+            x = block(x)
+
+        # 最终层归一化和输出logits
+        x = self.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
+        # 计算损失（如果提供了目标）
+        loss = None
+        if targets is not None:
+            # 交叉熵损失：需要将logits展平为(B*T, vocab_size)，targets展平为(B*T,)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1)
+            )
+
+        return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
         def decay_filter(x: ms.Parameter) -> bool:
@@ -117,7 +238,29 @@ class GPT(nn.Cell):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        pass
+        for _ in range(max_new_tokens):
+            # 确保序列长度不超过block_size
+            idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:, -self.config.block_size:]
+
+            # 获取预测logits
+            logits, _ = self.construct(idx_cond)
+            # 只关注最后一个token的预测
+            logits = logits[:, -1, :] / temperature  # 应用温度缩放
+
+            # Top-K过滤
+            if top_k is not None:
+                v, _ = ops.top_k(logits, min(top_k, logits.shape[-1]))
+                logits = logits.masked_fill(logits < v[:, [-1]], -float("inf"))
+
+            # 采样概率分布
+            probs = ops.softmax(logits, axis=-1)
+            idx_next = ops.multinomial(probs, num_samples=1)  # 采样下一个token
+
+            # 拼接序列
+            idx = ops.cat([idx, idx_next], axis=1)
+
+        return idx
+
 
 
 class GPTWithLoss(nn.Cell):
