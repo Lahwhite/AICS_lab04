@@ -1,5 +1,7 @@
 import argparse
 
+import os
+
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import context
@@ -36,7 +38,7 @@ def run_train():
         choices=["true", "false"],
         help="Run distribute, default is false.",
     )
-    parser.add_argument("--epoch", type=int, default=2, help="Epoches, default is 2.")
+    parser.add_argument("--epoch", type=int, default=1, help="Epoches, default is 1.")
     parser.add_argument(
         "--data_path",
         type=str,
@@ -128,11 +130,13 @@ def run_train():
     gpt = GPT(gpt_config)
     gpt_with_loss = GPTWithLoss(gpt)
 
+    data_path = os.environ.get("SM_CHANNEL_TRAIN", "./dataset")
     ds = create_dataset(
         batch_size=args_opt.batch_size,
-        data_path=args_opt.data_path,
+        data_path=data_path,
         device_num=device_num,
         rank=rank,
+        drop=True,
     )
 
     print("crated dataset")

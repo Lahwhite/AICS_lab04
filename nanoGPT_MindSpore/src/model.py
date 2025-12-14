@@ -4,107 +4,10 @@ from typing import Optional
 import mindspore as ms
 import mindspore.nn as nn
 import mindspore.numpy as np
-from mindspore import ops
+from mindspore import ops, Parameter
 from mindspore.common.initializer import Normal, initializer
 from mindspore.ops import functional as F
 
-# TODO: 实现 GPT 模型结构
-
-
-class LayerNorm(nn.Cell):
-    """LayerNorm but with an optional bias."""
-
-    def __init__(self, ndim: int, bias: bool):
-        super().__init__()
-        self.weight = ms.Parameter(ms.ones((ndim,)))
-        self.bias = ms.Parameter(ms.zeros((ndim,))) if bias else None
-        self.eps = 1e-5
-
-    def construct(self, x: ms.Tensor) -> ms.Tensor:
-        # 计算均值和方差（在最后一个维度上）
-        mean = x.mean(-1, keep_dims=True)
-        var = x.var(-1, keep_dims=True, unbiased=False)
-        # 归一化
-        x = (x - mean) / ops.sqrt(var + self.eps)
-        # 应用缩放和偏移
-        x = x * self.weight
-        if self.bias is not None:
-            x = x + self.bias
-        return x
-
-
-class CausalSelfAttention(nn.Cell):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_size = config.n_embd // config.n_head
-
-        # QKV投影（合并为一个线性层提高效率）
-        self.qkv_proj = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # 输出投影
-        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # Dropout层
-        self.attn_drop = nn.Dropout(config.dropout)
-        self.resid_drop = nn.Dropout(config.dropout)
-
-        # 因果掩码（下三角矩阵）：防止关注未来token
-        self.mask = np.tril(np.ones((config.block_size, config.block_size), dtype=ms.bool_))
-
-    def construct(self, x: ms.Tensor) -> ms.Tensor:
-        B, T, C = x.shape  # 批次大小, 序列长度, 嵌入维度
-
-        # QKV投影并拆分 (B, T, 3*C) -> (B, T, 3, H, C/H) -> 3*(B, H, T, C/H)
-        qkv = self.qkv_proj(x).reshape(B, T, 3, self.n_head, self.head_size)
-        q, k, v = ops.unstack(qkv, axis=2)  # 拆分Q、K、V
-
-        # 注意力计算: (B, H, T, T)
-        attn = (q @ ops.transpose(k, (0, 1, 3, 2))) * (1.0 / ops.sqrt(ms.Tensor(self.head_size, dtype=ms.float32)))
-        # 应用因果掩码（掩盖未来位置）
-        attn = attn.masked_fill(self.mask[:T, :T] == 0, -1e18)
-        attn = ops.softmax(attn, axis=-1)
-        attn = self.attn_drop(attn)
-
-        # 注意力输出: (B, H, T, C/H) -> (B, T, H*C/H) = (B, T, C)
-        y = attn @ v
-        y = ops.transpose(y, (0, 2, 1, 3)).reshape(B, T, C)
-
-        # 输出投影和残差dropout
-        y = self.resid_drop(self.out_proj(y))
-        return y
-
-
-class MLP(nn.Cell):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
-        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def construct(self, x: ms.Tensor) -> ms.Tensor:
-        x = self.fc1(x)
-        x = self.gelu(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
-
-
-class Block(nn.Cell):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.ln1 = LayerNorm(config.n_embd, bias=config.bias)  # 注意力前的层归一化
-        self.attn = CausalSelfAttention(config)
-        self.ln2 = LayerNorm(config.n_embd, bias=config.bias)  # MLP前的层归一化
-        self.mlp = MLP(config)
-
-    def construct(self, x: ms.Tensor) -> ms.Tensor:
-        # 注意力残差连接
-        x = x + self.attn(self.ln1(x))
-        # MLP残差连接
-        x = x + self.mlp(self.ln2(x))
-        return x
 
 
 @dataclass
@@ -118,6 +21,148 @@ class GPTConfig:
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster # fmt:skip
 
 
+# TODO: 实现 GPT 模型结构
+
+
+class LayerNorm(nn.Cell):
+    """LayerNorm but with an optional bias."""
+
+    def __init__(self, ndim: int, bias: bool):
+        super().__init__()
+        # 初始化缩放参数（全1）
+        self.weight = Parameter(ms.Tensor(np.ones((ndim,)), dtype=ms.float32))
+        # 初始化偏移参数（全0，可选）
+        self.bias = Parameter(ms.Tensor(np.zeros((ndim,)), dtype=ms.float32)) if bias else None
+        self.eps = 1e-5
+        self.reduce_mean = ops.ReduceMean(keep_dims=True)
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        # 步骤1：计算最后一维的均值 E[X]
+        mean = self.reduce_mean(x, -1)
+        
+        # 步骤2：手动计算方差 var = E[X²] - (E[X])²（替代ReduceVariance）
+        x_square = x * x  # 计算X²
+        mean_square = self.reduce_mean(x_square, -1)  # E[X²]
+        mean_squared = mean * mean  # (E[X])²
+        var = mean_square - mean_squared  # 方差
+        # 归一化
+        x = (x - mean) / ops.sqrt(var + self.eps)
+        # 应用缩放和偏移
+        x = x * self.weight
+        if self.bias is not None:
+            x = x + self.bias
+        return x
+
+
+class CausalSelfAttention(nn.Cell):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # 核心参数
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_size = config.n_embd // config.n_head
+        # QKV 投影层（合并为一个线性层，效率更高）
+        self.qkv_proj = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # 输出投影层
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Dropout（改用p参数，消除警告）
+        self.attn_drop = nn.Dropout(p = config.dropout)
+        self.resid_drop = nn.Dropout(p = config.dropout)
+        
+        # 修正1：构建因果掩码（扩展为4维，适配注意力分数维度）
+        # 原始mask：[config.block_size, config.block_size] → 扩展为 [1, 1, config.block_size, config.block_size]
+        # 1: 批次维度广播, 1: 注意力头维度广播, block_size×block_size: 序列维度
+        self.mask = ms.Tensor(np.tril(np.ones((config.block_size, config.block_size), dtype=ms.bool_)), dtype=ms.bool_)
+        # 扩展维度：[block_size, block_size] → [1, 1, block_size, block_size]
+        self.mask = ops.ExpandDims()(self.mask, 0)
+        self.mask = ops.ExpandDims()(self.mask, 0)
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        # 输入x形状：[batch_size, seq_len, n_embd]
+        B, T, C = x.shape  # B=批次, T=序列长度, C=嵌入维度
+        
+        # 修正2：拆分QKV并调整维度顺序（标准GPT注意力维度逻辑）
+        # 1. QKV投影：[B, T, C] → [B, T, 3*C]
+        qkv = self.qkv_proj(x)
+        # 2. 拆分为Q/K/V：[B, T, 3*C] → 3 × [B, T, C]
+        q, k, v = ops.Split(axis=2, output_num=3)(qkv)
+        # 3. 拆分注意力头：[B, T, C] → [B, T, n_head, head_size]
+        q = ops.Reshape()(q, (B, T, self.n_head, self.head_size))
+        k = ops.Reshape()(k, (B, T, self.n_head, self.head_size))
+        v = ops.Reshape()(v, (B, T, self.n_head, self.head_size))
+        # 4. 转置维度：[B, T, n_head, head_size] → [B, n_head, T, head_size]
+        # （关键：将注意力头维度提到序列维度前，方便计算注意力分数）
+        q = ops.Transpose()(q, (0, 2, 1, 3))
+        k = ops.Transpose()(k, (0, 2, 1, 3))
+        v = ops.Transpose()(v, (0, 2, 1, 3))
+        
+        # 修正3：计算注意力分数（Q @ K.T），并适配mask形状
+        # 注意力分数形状：[B, n_head, T, T]
+        attn_score = ops.BatchMatMul(transpose_b=True)(q, k)  # Q @ K.T
+        # 缩放注意力分数（除以头维度的平方根）
+        attn_score = attn_score / ops.Sqrt()(ms.Tensor(self.head_size, dtype=ms.float32))
+        
+        # 修正4：应用因果掩码（mask形状[1,1,block_size,block_size] → 广播到[B,n_head,T,T]）
+        # 先裁剪mask到当前序列长度T（避免block_size > T时的形状不匹配）
+        mask = self.mask[:, :, :T, :T]
+        # 将mask转换为数值掩码（False→-inf，True→0），用于屏蔽未来位置
+        neg_inf = ms.Tensor(-1e9, dtype=ms.float32)
+        attn_mask = ops.Select()(mask, ms.Tensor(0.0, dtype=ms.float32), neg_inf)
+        # 应用掩码到注意力分数
+        attn_score = attn_score + attn_mask
+        
+        # 注意力归一化 + Dropout
+        attn_weight = ops.Softmax(axis=-1)(attn_score)
+        attn_weight = self.attn_drop(attn_weight)
+        
+        # 注意力加权求和（@ V）
+        attn_out = ops.BatchMatMul()(attn_weight, v)  # [B, n_head, T, head_size]
+        
+        # 修正5：还原维度顺序，合并注意力头
+        # 转置：[B, n_head, T, head_size] → [B, T, n_head, head_size]
+        attn_out = ops.Transpose()(attn_out, (0, 2, 1, 3))
+        # 合并头：[B, T, n_head, head_size] → [B, T, n_embd]
+        attn_out = ops.Reshape()(attn_out, (B, T, self.n_embd))
+        
+        # 输出投影 + Dropout
+        attn_out = self.out_proj(attn_out)
+        attn_out = self.resid_drop(attn_out)
+        
+        return attn_out
+
+class MLP(nn.Cell):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(p = config.dropout)
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        x = self.fc1(x)
+        x = self.gelu(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
+
+
+class Block(nn.Cell):
+    """GPT的基础块：注意力 + MLP"""
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln1 = LayerNorm(config.n_embd, bias=config.bias)  # 注意力前LN
+        self.attn = CausalSelfAttention(config)               # 因果自注意力
+        self.ln2 = LayerNorm(config.n_embd, bias=config.bias)  # MLP前LN
+        self.mlp = MLP(config)                                # 前馈网络
+
+    def construct(self, x: ms.Tensor) -> ms.Tensor:
+        # 残差连接：注意力分支
+        x = x + self.attn(self.ln1(x))
+        # 残差连接：MLP分支
+        x = x + self.mlp(self.ln2(x))
+        return x
+
 class GPT(nn.Cell):
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -128,7 +173,7 @@ class GPT(nn.Cell):
          # 核心组件
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)  # Token嵌入
         self.wpe = nn.Embedding(config.block_size, config.n_embd)  # 位置嵌入
-        self.drop = nn.Dropout(config.dropout)
+        self.drop = nn.Dropout(p = config.dropout)
         self.blocks = nn.SequentialCell([Block(config) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, bias=config.bias)  # 最终层归一化
 
